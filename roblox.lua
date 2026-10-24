@@ -1,563 +1,1258 @@
---[[
-================================================================================
-  ZakaBulletTracker   v1.3   (PC / 移动端 一体完整版)
-  静默瞄准 (Silent Aim) + 子弹飞行向量追踪 (Bullet Tracking)
---------------------------------------------------------------------------------
-  两套机制:
-    ① Silent   —— hook 弹道类方法 (Raycast / RaycastAll / FindPartOnRay*)，
-                   把本次射线的方向掰向目标。不改镜头、不动鼠标、不抢视角。
-    ② Velocity —— 子弹出膛后逐帧修正它的速度向量，让弹道拐向目标。
+-- Roblox ESP + Fly UI (mobile-friendly)
+-- 仅建议在自建或获准测试的体验中使用。
 
-  相对上一版的改动:
-    - 砍掉全局 __index hook (拦全场属性读取，风险最大收益最小)，
-      改成主循环轮询 mouse.Hit —— 顺带解掉 "lacking capability Plugin" 警告
-    - __namecall 窄化: 查表命中才处理，其余调用原样透传，不做任何附带方法调用
-    - 穿墙检测的内部调用守卫 (inInternalCall)，防止自己的 hook 拦自己
-    - 移动端: 触摸按键内建 / FOV 按屏幕短边自适应 / 性能自动降档 / 禁 Camera 模式
-
-  用法:
-    进对局 → 执行脚本 → 顶部弹「已加载」
-    PC : E = 开关     Q = 锁定当前目标     F = 按住才瞄 (HoldToAim 打开时生效)
-    手机: 右侧竖排三个触摸键「追踪 / 锁定 / 按住」
-    卸载: getgenv().zakaBulletTracker.unload()
-================================================================================
---]]
-
---==============================================================================
--- 0. 服务与基础环境
---==============================================================================
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local Workspace        = game:GetService("Workspace")
-local StarterGui       = game:GetService("StarterGui")
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then return end
 
-local LP     = Players.LocalPlayer
-local Camera = Workspace.CurrentCamera
-local mouse  = LP:GetMouse()
+local flySpeed = 55
 
-local unpack = table.unpack or unpack
-
--- 移动端判定: 有触摸输入且没有实体鼠标 => 手机 / 平板
-local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
-
---==============================================================================
--- 1. 配置
---==============================================================================
-local Config = {
-    Enabled   = true,
-    Mode      = "All",          -- All(=Silent+Velocity) / Silent / Velocity / Camera
-    HoldToAim = false,          -- true = 按住 HoldKey / 屏幕「按住」键才瞄
-
-    -- 键位 (PC)
-    ToggleKey = Enum.KeyCode.E,
-    LockKey   = Enum.KeyCode.Q,
-    HoldKey   = Enum.KeyCode.F,
-
-    -- 弹道
-    Prediction  = 0.12,         -- 提前量(秒)。打飘就 0.15~0.20
-    BulletSpeed = 900,          -- 仅参考用，实际取子弹自身速度
-    SpeedBoost  = 1.0,          -- >1 = 子弹提速
-
-    -- 索敌
-    FOV        = 250,           -- PC 像素；手机会被 updateFov() 覆盖
-    MaxDistance = 2000,
-    TeamCheck   = true,
-    WallCheck   = false,        -- 每人一次射线，人一多就掉帧，手机默认关
-
-    -- 过滤 / 识别
-    IgnoreNames = {             -- 角色里出现这些零件名就当无效目标
-        BulletTrail = true, Effect = true, Smoke = true, Highlight = true,
-    },
-    BulletNames = {             -- 子弹零件名关键字(按你玩的游戏对一下)
-        "Bullet", "Projectile", "Shell", "Arrow", "Bolt", "Throwable", "Shoot",
-    },
-
-    -- 性能
-    MaxBullets = 8,
-    UpdateRate = 0.05,          -- 索敌刷新间隔(秒)
-
-    -- 其它
-    CameraSmooth     = 0.25,    -- Camera 模式跟枪平滑度
-    UseMouseHitAim   = false,   -- 用 mouse.Hit 落点当补充准星(老式脚本思路)
-    HookMouseIndex   = false,   -- 保持关。全局 __index hook 已废弃，勿开
-}
-
--- 手机自动降档: 砍掉两个掉帧大头 —— 逐子弹修正的数量 + 穿墙射线
-if IS_MOBILE then
-    Config.MaxBullets = 4
-    Config.UpdateRate = 0.08
-    Config.WallCheck  = false
-    Config.Mode       = (Config.Mode == "Camera") and "All" or Config.Mode
+-- Remove a previous copy.
+for _, parent in ipairs({game:GetService("CoreGui"), LocalPlayer:FindFirstChildOfClass("PlayerGui")}) do
+    if parent then
+        local old = parent:FindFirstChild("NinjaESPFlyMobile")
+        if old then pcall(function() old:Destroy() end) end
+    end
 end
 
---==============================================================================
--- 2. 状态
---==============================================================================
-local currentTarget, currentPart, lockedPlayer = nil, nil, nil
-local connections  = {}
-local hud
-local mobileHold   = false
-local oldNamecall
-local hookedByMeta = false
-local inInternalCall = false
-local mouseHit     = nil
+local gui = Instance.new("ScreenGui")
+gui.Name = "NinjaESPFlyMobile"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
---==============================================================================
--- 3. 小工具
---==============================================================================
-local function notify(text)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "ZakaBulletTracker", Text = text, Duration = 2,
-        })
+-- Prefer PlayerGui: some mobile injectors render CoreGui overlays but do not
+-- route touch input to them reliably. Fall back to CoreGui only if needed.
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local parented = pcall(function()
+    gui.Parent = playerGui
+end)
+if not parented or not gui.Parent then
+    pcall(function() gui.Parent = game:GetService("CoreGui") end)
+end
+
+-- Animated mobile loading splash. This is a visual intro only; it does not
+-- block the script from creating the main controls underneath it.
+local loadingOverlay = Instance.new("Frame")
+loadingOverlay.Name = "LoadingOverlay"
+loadingOverlay.Size = UDim2.fromScale(1, 1)
+loadingOverlay.Position = UDim2.fromScale(0, 0)
+loadingOverlay.BackgroundColor3 = Color3.fromRGB(9, 12, 24)
+loadingOverlay.BackgroundTransparency = 0.04
+loadingOverlay.BorderSizePixel = 0
+loadingOverlay.ZIndex = 100
+loadingOverlay.Parent = gui
+
+local overlayGradient = Instance.new("UIGradient")
+overlayGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(10, 15, 34)),
+    ColorSequenceKeypoint.new(0.55, Color3.fromRGB(25, 18, 51)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(6, 28, 39)),
+})
+overlayGradient.Rotation = 25
+overlayGradient.Parent = loadingOverlay
+
+local loadingCard = Instance.new("Frame")
+loadingCard.Name = "LoadingCard"
+loadingCard.AnchorPoint = Vector2.new(0.5, 0.5)
+loadingCard.Position = UDim2.fromScale(0.5, 0.5)
+loadingCard.Size = UDim2.fromOffset(292, 282)
+loadingCard.BackgroundColor3 = Color3.fromRGB(19, 23, 41)
+loadingCard.BorderSizePixel = 0
+loadingCard.ZIndex = 101
+loadingCard.Parent = loadingOverlay
+local loadingCardCorner = Instance.new("UICorner")
+loadingCardCorner.CornerRadius = UDim.new(0, 20)
+loadingCardCorner.Parent = loadingCard
+local loadingCardStroke = Instance.new("UIStroke")
+loadingCardStroke.Color = Color3.fromRGB(74, 231, 220)
+loadingCardStroke.Thickness = 1.5
+loadingCardStroke.Transparency = 0.18
+loadingCardStroke.Parent = loadingCard
+local cardGradient = Instance.new("UIGradient")
+cardGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(27, 35, 62)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(17, 25, 38)),
+})
+cardGradient.Rotation = 90
+cardGradient.Parent = loadingCard
+
+local loadingEyebrow = Instance.new("TextLabel")
+loadingEyebrow.BackgroundTransparency = 1
+loadingEyebrow.Position = UDim2.fromOffset(18, 15)
+loadingEyebrow.Size = UDim2.new(1, -36, 0, 18)
+loadingEyebrow.Font = Enum.Font.GothamSemibold
+loadingEyebrow.Text = "MOBILE EDITION  /  INITIALIZING"
+loadingEyebrow.TextColor3 = Color3.fromRGB(100, 224, 219)
+loadingEyebrow.TextSize = 10
+loadingEyebrow.ZIndex = 102
+loadingEyebrow.Parent = loadingCard
+
+local ringOuter = Instance.new("Frame")
+ringOuter.Name = "OuterEnergyRing"
+ringOuter.AnchorPoint = Vector2.new(0.5, 0.5)
+ringOuter.Position = UDim2.new(0.5, 0, 0, 100)
+ringOuter.Size = UDim2.fromOffset(82, 82)
+ringOuter.BackgroundTransparency = 1
+ringOuter.BorderSizePixel = 0
+ringOuter.ZIndex = 102
+ringOuter.Parent = loadingCard
+local ringOuterCorner = Instance.new("UICorner")
+ringOuterCorner.CornerRadius = UDim.new(1, 0)
+ringOuterCorner.Parent = ringOuter
+local ringOuterStroke = Instance.new("UIStroke")
+ringOuterStroke.Color = Color3.fromRGB(75, 235, 218)
+ringOuterStroke.Thickness = 3
+ringOuterStroke.Transparency = 0.08
+ringOuterStroke.Parent = ringOuter
+
+local ringInner = Instance.new("Frame")
+ringInner.Name = "InnerEnergyRing"
+ringInner.AnchorPoint = Vector2.new(0.5, 0.5)
+ringInner.Position = UDim2.new(0.5, 0, 0.5, 0)
+ringInner.Size = UDim2.fromOffset(61, 61)
+ringInner.BackgroundTransparency = 1
+ringInner.BorderSizePixel = 0
+ringInner.ZIndex = 103
+ringInner.Parent = ringOuter
+local ringInnerCorner = Instance.new("UICorner")
+ringInnerCorner.CornerRadius = UDim.new(1, 0)
+ringInnerCorner.Parent = ringInner
+local ringInnerStroke = Instance.new("UIStroke")
+ringInnerStroke.Color = Color3.fromRGB(150, 103, 255)
+ringInnerStroke.Thickness = 2
+ringInnerStroke.Transparency = 0.12
+ringInnerStroke.Parent = ringInner
+
+local loadingLogo = Instance.new("TextLabel")
+loadingLogo.AnchorPoint = Vector2.new(0.5, 0.5)
+loadingLogo.Position = UDim2.fromScale(0.5, 0.5)
+loadingLogo.Size = UDim2.fromOffset(48, 48)
+loadingLogo.BackgroundTransparency = 1
+loadingLogo.Font = Enum.Font.GothamBlack
+loadingLogo.Text = "N"
+loadingLogo.TextColor3 = Color3.fromRGB(255, 255, 255)
+loadingLogo.TextSize = 34
+loadingLogo.ZIndex = 104
+loadingLogo.Parent = ringOuter
+
+local loadingTitle = Instance.new("TextLabel")
+loadingTitle.BackgroundTransparency = 1
+loadingTitle.Position = UDim2.fromOffset(14, 151)
+loadingTitle.Size = UDim2.new(1, -28, 0, 34)
+loadingTitle.Font = Enum.Font.GothamBlack
+loadingTitle.Text = "NINJA HUB"
+loadingTitle.TextColor3 = Color3.fromRGB(245, 248, 255)
+loadingTitle.TextSize = 25
+loadingTitle.ZIndex = 102
+loadingTitle.Parent = loadingCard
+
+local loadingSubtitle = Instance.new("TextLabel")
+loadingSubtitle.BackgroundTransparency = 1
+loadingSubtitle.Position = UDim2.fromOffset(16, 187)
+loadingSubtitle.Size = UDim2.new(1, -32, 0, 20)
+loadingSubtitle.Font = Enum.Font.Gotham
+loadingSubtitle.Text = "正在初始化手机界面..."
+loadingSubtitle.TextColor3 = Color3.fromRGB(173, 185, 211)
+loadingSubtitle.TextSize = 12
+loadingSubtitle.ZIndex = 102
+loadingSubtitle.Parent = loadingCard
+
+local progressTrack = Instance.new("Frame")
+progressTrack.Position = UDim2.fromOffset(24, 221)
+progressTrack.Size = UDim2.new(1, -48, 0, 7)
+progressTrack.BackgroundColor3 = Color3.fromRGB(43, 51, 74)
+progressTrack.BorderSizePixel = 0
+progressTrack.ZIndex = 102
+progressTrack.Parent = loadingCard
+local progressTrackCorner = Instance.new("UICorner")
+progressTrackCorner.CornerRadius = UDim.new(1, 0)
+progressTrackCorner.Parent = progressTrack
+
+local progressFill = Instance.new("Frame")
+progressFill.Name = "ProgressFill"
+progressFill.Size = UDim2.new(0, 0, 1, 0)
+progressFill.BackgroundColor3 = Color3.fromRGB(74, 231, 220)
+progressFill.BorderSizePixel = 0
+progressFill.ZIndex = 103
+progressFill.Parent = progressTrack
+local progressFillCorner = Instance.new("UICorner")
+progressFillCorner.CornerRadius = UDim.new(1, 0)
+progressFillCorner.Parent = progressFill
+local progressGradient = Instance.new("UIGradient")
+progressGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(68, 231, 215)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(163, 104, 255)),
+})
+progressGradient.Parent = progressFill
+
+local loadingHint = Instance.new("TextLabel")
+loadingHint.BackgroundTransparency = 1
+loadingHint.Position = UDim2.fromOffset(20, 238)
+loadingHint.Size = UDim2.new(1, -40, 0, 20)
+loadingHint.Font = Enum.Font.GothamSemibold
+loadingHint.Text = "LOADING  0%"
+loadingHint.TextColor3 = Color3.fromRGB(120, 228, 220)
+loadingHint.TextSize = 10
+loadingHint.ZIndex = 102
+loadingHint.Parent = loadingCard
+
+local outerSpinTween = TweenService:Create(
+    ringOuter,
+    TweenInfo.new(2.4, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1),
+    {Rotation = 360}
+)
+local innerSpinTween = TweenService:Create(
+    ringInner,
+    TweenInfo.new(1.6, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1),
+    {Rotation = -360}
+)
+local progressTween = TweenService:Create(
+    progressFill,
+    TweenInfo.new(2.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+    {Size = UDim2.new(1, 0, 1, 0)}
+)
+local logoPulseTween = TweenService:Create(
+    loadingLogo,
+    TweenInfo.new(0.55, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    {TextSize = 38, TextColor3 = Color3.fromRGB(117, 255, 239)}
+)
+outerSpinTween:Play()
+innerSpinTween:Play()
+progressTween:Play()
+logoPulseTween:Play()
+
+task.spawn(function()
+    for percent = 1, 100 do
+        if not loadingOverlay.Parent then return end
+        loadingHint.Text = "LOADING  " .. tostring(percent) .. "%"
+        if percent == 34 then
+            loadingSubtitle.Text = "正在加载界面组件..."
+        elseif percent == 68 then
+            loadingSubtitle.Text = "正在准备触控按钮..."
+        end
+        task.wait(2.25 / 100)
+    end
+
+    loadingSubtitle.Text = "初始化完成"
+    task.wait(0.22)
+    outerSpinTween:Cancel()
+    innerSpinTween:Cancel()
+    logoPulseTween:Cancel()
+
+    local fadeInfo = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local fadeTasks = {
+        TweenService:Create(loadingOverlay, fadeInfo, {BackgroundTransparency = 1}),
+    }
+    for _, object in ipairs(loadingOverlay:GetDescendants()) do
+        if object:IsA("GuiObject") then
+            local properties = {BackgroundTransparency = 1}
+            if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+                properties.TextTransparency = 1
+                properties.TextStrokeTransparency = 1
+            elseif object:IsA("ImageLabel") or object:IsA("ImageButton") then
+                properties.ImageTransparency = 1
+            end
+            fadeTasks[#fadeTasks + 1] = TweenService:Create(object, fadeInfo, properties)
+        elseif object:IsA("UIStroke") then
+            fadeTasks[#fadeTasks + 1] = TweenService:Create(object, fadeInfo, {Transparency = 1})
+        end
+    end
+    for _, tween in ipairs(fadeTasks) do tween:Play() end
+    task.wait(0.4)
+    if loadingOverlay.Parent then loadingOverlay:Destroy() end
+end)
+
+local frame = Instance.new("Frame")
+frame.Name = "Main"
+frame.Size = UDim2.fromOffset(300, 622)
+frame.Position = UDim2.new(0, 12, 0.08, 0)
+frame.BackgroundColor3 = Color3.fromRGB(26, 29, 39)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.ClipsDescendants = true
+frame.Parent = gui
+
+local frameCorner = Instance.new("UICorner")
+frameCorner.CornerRadius = UDim.new(0, 12)
+frameCorner.Parent = frame
+
+-- Rectangular feature-list container. All existing controls are laid out
+-- inside this panel; it is created before the controls so they render above it.
+local featurePanel = Instance.new("Frame")
+featurePanel.Name = "FeatureListPanel"
+featurePanel.Position = UDim2.fromOffset(6, 46)
+featurePanel.Size = UDim2.fromOffset(288, 570)
+featurePanel.BackgroundColor3 = Color3.fromRGB(18, 22, 32)
+featurePanel.BackgroundTransparency = 0.06
+featurePanel.BorderSizePixel = 0
+featurePanel.Active = false
+featurePanel.ZIndex = 1
+featurePanel.Parent = frame
+
+local featurePanelCorner = Instance.new("UICorner")
+featurePanelCorner.CornerRadius = UDim.new(0, 10)
+featurePanelCorner.Parent = featurePanel
+
+local featurePanelStroke = Instance.new("UIStroke")
+featurePanelStroke.Color = Color3.fromRGB(74, 231, 220)
+featurePanelStroke.Thickness = 1.25
+featurePanelStroke.Transparency = 0.28
+featurePanelStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+featurePanelStroke.Parent = featurePanel
+
+local featurePanelGradient = Instance.new("UIGradient")
+featurePanelGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 28, 42)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(17, 20, 31)),
+})
+featurePanelGradient.Rotation = 90
+featurePanelGradient.Parent = featurePanel
+
+local scale = Instance.new("UIScale")
+scale.Parent = frame
+
+local function updateScale()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local viewport = camera.ViewportSize
+    -- Fit narrow phones while keeping touch targets reasonably large.
+    scale.Scale = math.clamp(math.min(viewport.X / 340, viewport.Y / 650), 0.65, 1.0)
+end
+updateScale()
+if workspace.CurrentCamera then
+    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+end
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(updateScale)
+
+local title = Instance.new("TextButton")
+title.Name = "TitleDragHandle"
+title.Size = UDim2.new(1, 0, 0, 42)
+title.BackgroundColor3 = Color3.fromRGB(55, 67, 102)
+title.BorderSizePixel = 0
+title.Text = "  Ninja | ESP + Fly"
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextSize = 14
+title.Font = Enum.Font.GothamBold
+title.AutoButtonColor = false
+title.Active = true
+title.Parent = frame
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 12)
+titleCorner.Parent = title
+
+-- A compact toggle that keeps the title bar visible while the panel is folded.
+local expandedFrameSize = frame.Size
+local minimized = false
+local minimizeButton = Instance.new("TextButton")
+minimizeButton.Name = "MinimizeToggle"
+minimizeButton.Size = UDim2.fromOffset(34, 30)
+minimizeButton.Position = UDim2.new(1, -40, 0, 6)
+minimizeButton.BackgroundColor3 = Color3.fromRGB(76, 89, 126)
+minimizeButton.BorderSizePixel = 0
+minimizeButton.Text = "−"
+minimizeButton.TextColor3 = Color3.new(1, 1, 1)
+minimizeButton.TextSize = 22
+minimizeButton.Font = Enum.Font.GothamBold
+minimizeButton.AutoButtonColor = true
+minimizeButton.Active = true
+minimizeButton.ZIndex = 3
+minimizeButton.Parent = frame
+local minimizeCorner = Instance.new("UICorner")
+minimizeCorner.CornerRadius = UDim.new(0, 7)
+minimizeCorner.Parent = minimizeButton
+
+local function toggleMinimized()
+    minimized = not minimized
+    if minimized then
+        frame.Size = UDim2.new(expandedFrameSize.X.Scale, expandedFrameSize.X.Offset, 0, 42)
+        minimizeButton.Text = "+"
+        title.Text = "  Ninja | ESP + Fly (已缩小)"
+    else
+        frame.Size = expandedFrameSize
+        minimizeButton.Text = "−"
+        title.Text = "  Ninja | ESP + Fly"
+    end
+end
+
+-- InputBegan is used for compatibility with mobile injectors that may not fire Activated.
+minimizeButton.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        toggleMinimized()
+    end
+end)
+
+local function makeButton(text, x, y, w, h)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.fromOffset(w, h)
+    button.Position = UDim2.fromOffset(x, y)
+    button.BackgroundColor3 = Color3.fromRGB(65, 77, 110)
+    button.TextColor3 = Color3.new(1, 1, 1)
+    button.TextSize = 15
+    button.Font = Enum.Font.GothamSemibold
+    button.Text = text
+    button.AutoButtonColor = true
+    button.Active = true
+    button.Parent = frame
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = button
+    return button
+end
+
+local espButton = makeButton("透视：关闭", 12, 52, 132, 38)
+local flyButton = makeButton("飞天：关闭", 156, 52, 132, 38)
+local upButton = makeButton("按住上升 ▲", 12, 96, 132, 38)
+local downButton = makeButton("按住下降 ▼", 156, 96, 132, 38)
+
+local speedDownButton = makeButton("−", 12, 140, 50, 36)
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Size = UDim2.fromOffset(164, 36)
+speedLabel.Position = UDim2.fromOffset(68, 140)
+speedLabel.BackgroundColor3 = Color3.fromRGB(42, 46, 60)
+speedLabel.TextColor3 = Color3.new(1, 1, 1)
+speedLabel.TextSize = 14
+speedLabel.Font = Enum.Font.GothamSemibold
+speedLabel.Text = "飞行速度：55"
+speedLabel.Parent = frame
+local speedLabelCorner = Instance.new("UICorner")
+speedLabelCorner.CornerRadius = UDim.new(0, 8)
+speedLabelCorner.Parent = speedLabel
+local speedUpButton = makeButton("+", 230, 140, 58, 36)
+
+local teleportTitle = Instance.new("TextLabel")
+teleportTitle.Size = UDim2.new(1, -24, 0, 22)
+teleportTitle.Position = UDim2.fromOffset(12, 180)
+teleportTitle.BackgroundTransparency = 1
+teleportTitle.Text = "坐标传送（X / Y / Z）"
+teleportTitle.TextColor3 = Color3.fromRGB(225, 230, 245)
+teleportTitle.TextSize = 13
+teleportTitle.Font = Enum.Font.GothamSemibold
+teleportTitle.TextXAlignment = Enum.TextXAlignment.Left
+teleportTitle.Parent = frame
+
+local function makeCoordinateBox(placeholder, x)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.fromOffset(88, 38)
+    box.Position = UDim2.fromOffset(x, 205)
+    box.BackgroundColor3 = Color3.fromRGB(42, 46, 60)
+    box.TextColor3 = Color3.new(1, 1, 1)
+    box.PlaceholderColor3 = Color3.fromRGB(175, 180, 195)
+    box.PlaceholderText = placeholder
+    box.Text = ""
+    box.ClearTextOnFocus = false
+    box.TextSize = 15
+    box.Font = Enum.Font.Gotham
+    box.TextXAlignment = Enum.TextXAlignment.Center
+    -- TextBox 没有 KeyboardType 属性；手机键盘会在 TextBox 获得焦点时由 Roblox 自动弹出。
+    box.Parent = frame
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = box
+    return box
+end
+
+local xBox = makeCoordinateBox("X", 12)
+local yBox = makeCoordinateBox("Y", 106)
+local zBox = makeCoordinateBox("Z", 200)
+local teleportButton = makeButton("传送到坐标", 12, 247, 276, 36)
+
+local currentPositionButton = makeButton("查看当前坐标", 12, 289, 132, 36)
+local savePositionButton = makeButton("保存当前位置", 156, 289, 132, 36)
+
+local savedPositionLabel = Instance.new("TextLabel")
+savedPositionLabel.Size = UDim2.new(1, -24, 0, 38)
+savedPositionLabel.Position = UDim2.fromOffset(12, 329)
+savedPositionLabel.BackgroundColor3 = Color3.fromRGB(42, 46, 60)
+savedPositionLabel.TextColor3 = Color3.fromRGB(225, 230, 245)
+savedPositionLabel.TextSize = 12
+savedPositionLabel.TextWrapped = true
+savedPositionLabel.Font = Enum.Font.Gotham
+savedPositionLabel.Text = "已保存：0 个坐标\n先点击“保存当前位置”"
+savedPositionLabel.Parent = frame
+local savedPositionCorner = Instance.new("UICorner")
+savedPositionCorner.CornerRadius = UDim.new(0, 8)
+savedPositionCorner.Parent = savedPositionLabel
+
+local previousSavedButton = makeButton("◀ 上一个", 12, 369, 84, 34)
+local nextSavedButton = makeButton("下一个 ▶", 102, 369, 84, 34)
+local deleteSavedButton = makeButton("删除选中", 192, 369, 96, 34)
+local teleportSavedButton = makeButton("传送到选中坐标", 12, 407, 276, 36)
+
+local npcESPButton = makeButton("NPC绘制：关闭", 12, 449, 132, 36)
+local npcTrackButton = makeButton("NPC镜头追踪：关闭", 156, 449, 132, 36)
+local noclipButton = makeButton("穿墙：关闭", 12, 491, 276, 36)
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -24, 0, 42)
+status.Position = UDim2.fromOffset(12, 533)
+status.BackgroundTransparency = 1
+status.Text = "摇杆控制方向；NPC追踪为镜头辅助"
+status.TextColor3 = Color3.fromRGB(210, 215, 230)
+status.TextSize = 12
+status.TextWrapped = true
+status.Font = Enum.Font.Gotham
+status.Parent = frame
+
+local closeButton = makeButton("关闭脚本", 12, 580, 276, 32)
+closeButton.BackgroundColor3 = Color3.fromRGB(125, 58, 65)
+
+-- Make the panel draggable with a finger or mouse.
+do
+    local dragging = false
+    local dragInput
+    local dragStart
+    local startPosition
+
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            -- Do not start moving the window when the minimize toggle is pressed.
+            local insideMinimize = input.Position.X >= minimizeButton.AbsolutePosition.X
+                and input.Position.X <= minimizeButton.AbsolutePosition.X + minimizeButton.AbsoluteSize.X
+                and input.Position.Y >= minimizeButton.AbsolutePosition.Y
+                and input.Position.Y <= minimizeButton.AbsolutePosition.Y + minimizeButton.AbsoluteSize.Y
+            if insideMinimize then return end
+
+            dragging = true
+            dragStart = input.Position
+            startPosition = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    title.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+        end
     end)
 end
 
-local function getSelfCharacter()
-    local c = LP.Character
-    if not c or not c.Parent then return nil end
-    local hum = c:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return nil end
-    return c, hum
+local espEnabled = false
+local npcESPEnabled = false
+local npcTrackingEnabled = false
+local noclipEnabled = false
+local noclipOriginalCanCollide = {}
+local noclipConnection = nil
+local flying = false
+local closed = false
+local vertical = 0
+local espObjects = {}
+local npcESPObjects = {}
+local npcModels = {}
+local playerConnections = {}
+local npcRegistryConnection, npcTrackingConnection = nil, nil
+local flyVelocity, flyGyro, flyConnection
+local playerAddedConnection, playerRemovingConnection, respawnConnection
+local verticalInput
+local savedPositions = {}
+local selectedPositionIndex = 0
+local SAVE_FILE = "NinjaESPFlyMobile_savedcoords.txt"
+
+local function getLocalRoot()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
 end
 
-local function isAlive(plr)
-    local c = plr.Character
-    if not c or not c.Parent then return false end
-    local hum = c:FindFirstChildOfClass("Humanoid")
-    return hum ~= nil and hum.Health > 0
+local function formatPosition(position)
+    return string.format("X %.2f | Y %.2f | Z %.2f", position.X, position.Y, position.Z)
 end
 
-local HIT_PRIORITY = {
-    "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso",
-    "RightUpperArm", "LeftUpperArm", "RightLowerArm", "LeftLowerArm",
-}
+local function fillCoordinateBoxes(position)
+    xBox.Text = string.format("%.2f", position.X)
+    yBox.Text = string.format("%.2f", position.Y)
+    zBox.Text = string.format("%.2f", position.Z)
+end
 
-local function pickHitPart(char)
-    if not char then return nil end
-    for _, name in ipairs(HIT_PRIORITY) do
-        local p = char:FindFirstChild(name)
-        if p and p:IsA("BasePart") then return p end
+local function isValidCoordinate(value)
+    return value ~= nil and value == value and math.abs(value) < 1000000
+end
+
+local function persistPositions()
+    if type(writefile) ~= "function" then
+        return false
     end
-    return char:FindFirstChildWhichIsA("BasePart")
-end
-
--- FOV 自适应: 手机分辨率一换，写死的像素值等于全屏乱锁，必须按屏幕短边算
-local function updateFov()
-    local vp = Camera.ViewportSize
-    Config.FOV = math.floor(math.min(vp.X, vp.Y) * 0.40)
-end
-if IS_MOBILE then updateFov() end
-
---==============================================================================
--- 4. 目标筛选
---==============================================================================
-local function passesFilter(plr, char)
-    if plr == LP then return false end
-    if not isAlive(plr) then return false end
-    if Config.TeamCheck and LP.Team and plr.Team == LP.Team then return false end
-    for _, name in pairs(Config.IgnoreNames) do
-        if name and char:FindFirstChild(name) then return false end
+    local lines = {}
+    for _, position in ipairs(savedPositions) do
+        lines[#lines + 1] = string.format("%.6f,%.6f,%.6f", position.X, position.Y, position.Z)
     end
-    return true
-end
-
--- 穿墙检测。注意: Workspace:Raycast 也算 namecall，会被自己的 hook 拐一遍，
--- 所以这里必须先立 inInternalCall 守卫，否则"永远可见"。
-local function visible(part)
-    if not Config.WallCheck then return true end
-    local origin = Camera.CFrame.Position
-    local params = RaycastParams.new()
     local ok = pcall(function()
-        params.FilterType = Enum.RaycastFilterType.Exclude
+        writefile(SAVE_FILE, table.concat(lines, "\n"))
     end)
-    if not ok then
-        pcall(function() params.FilterType = Enum.RaycastFilterType.Blacklist end)
-    end
-    params.FilterDescendantsInstances = { LP.Character, Camera }
-
-    inInternalCall = true
-    local hit = Workspace:Raycast(origin, part.Position - origin, params)
-    inInternalCall = false
-
-    return hit == nil or hit.Instance:IsDescendantOf(part.Parent)
+    return ok
 end
 
-local function findTarget()
-    -- 已锁定: 只要目标还活着就一直用他，不换人
-    if lockedPlayer then
-        if isAlive(lockedPlayer) then
-            currentTarget = lockedPlayer
-            currentPart   = pickHitPart(lockedPlayer.Character)
-            return currentTarget, currentPart
-        end
-        lockedPlayer = nil
+local function refreshSavedPositionUI()
+    local count = #savedPositions
+    if count == 0 then
+        selectedPositionIndex = 0
+        savedPositionLabel.Text = "已保存：0 个坐标\n先点击“保存当前位置”"
+        previousSavedButton.Text = "◀ 上一个"
+        nextSavedButton.Text = "下一个 ▶"
+        return
     end
 
-    local selfChar = getSelfCharacter()
-    if not selfChar then
-        currentTarget, currentPart = nil, nil
+    selectedPositionIndex = math.clamp(selectedPositionIndex, 1, count)
+    local position = savedPositions[selectedPositionIndex]
+    savedPositionLabel.Text = string.format(
+        "坐标 %d/%d  |  X %.2f  Y %.2f  Z %.2f",
+        selectedPositionIndex, count, position.X, position.Y, position.Z
+    )
+end
+
+local function loadSavedPositions()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then
+        refreshSavedPositionUI()
+        return
+    end
+
+    local ok, payload = pcall(function()
+        if isfile(SAVE_FILE) then
+            return readfile(SAVE_FILE)
+        end
         return nil
+    end)
+    if not ok or type(payload) ~= "string" then
+        refreshSavedPositionUI()
+        return
     end
 
-    local aimPoint = UserInputService:GetMouseLocation()
-    local camPos   = Camera.CFrame.Position
-    local best, bestPart, bestScore = nil, nil, math.huge
+    -- Each line is X,Y,Z. A previous single-coordinate file is also compatible.
+    for line in payload:gmatch("[^\r\n]+") do
+        local sx, sy, sz = line:match("^%s*([^,]+),([^,]+),([^,]+)%s*$")
+        local x, y, z = tonumber(sx), tonumber(sy), tonumber(sz)
+        if isValidCoordinate(x) and isValidCoordinate(y) and isValidCoordinate(z) then
+            savedPositions[#savedPositions + 1] = Vector3.new(x, y, z)
+            if #savedPositions >= 100 then break end
+        end
+    end
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local char = plr.Character
-        if char and passesFilter(plr, char) then
-            local part = pickHitPart(char)
+    selectedPositionIndex = #savedPositions > 0 and #savedPositions or 0
+    refreshSavedPositionUI()
+end
+
+local function refreshSpeedLabel()
+    speedLabel.Text = "飞行速度：" .. tostring(flySpeed)
+end
+
+-- Use InputBegan for touch and mouse rather than relying only on Activated;
+-- this is more reliable in some injected mobile UI environments.
+local function bindButton(button, callback)
+    button.Active = true
+    button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            callback()
+        end
+    end)
+end
+
+bindButton(speedDownButton, function()
+    flySpeed = math.clamp(flySpeed - 5, 10, 150)
+    refreshSpeedLabel()
+end)
+
+bindButton(speedUpButton, function()
+    flySpeed = math.clamp(flySpeed + 5, 10, 150)
+    refreshSpeedLabel()
+end)
+
+bindButton(currentPositionButton, function()
+    local root = getLocalRoot()
+    if not root then
+        status.Text = "角色尚未准备好，无法读取当前坐标"
+        return
+    end
+    local position = root.Position
+    fillCoordinateBoxes(position)
+    status.Text = "当前位置：" .. formatPosition(position)
+end)
+
+bindButton(savePositionButton, function()
+    local root = getLocalRoot()
+    if not root then
+        status.Text = "角色尚未准备好，无法保存坐标"
+        return
+    end
+    if #savedPositions >= 100 then
+        status.Text = "最多保存 100 个坐标，请先删除不需要的条目"
+        return
+    end
+
+    local position = root.Position
+    savedPositions[#savedPositions + 1] = position
+    selectedPositionIndex = #savedPositions
+    fillCoordinateBoxes(position)
+    refreshSavedPositionUI()
+    local persisted = persistPositions()
+    if persisted then
+        status.Text = string.format("已保存第 %d 个坐标，共 %d 个（已写入文件）", selectedPositionIndex, #savedPositions)
+    else
+        status.Text = string.format("已保存第 %d 个坐标，共 %d 个（本次运行有效）", selectedPositionIndex, #savedPositions)
+    end
+end)
+
+bindButton(previousSavedButton, function()
+    local count = #savedPositions
+    if count == 0 then
+        status.Text = "还没有保存坐标"
+        return
+    end
+    selectedPositionIndex = ((selectedPositionIndex - 2) % count) + 1
+    refreshSavedPositionUI()
+    fillCoordinateBoxes(savedPositions[selectedPositionIndex])
+    status.Text = string.format("已选中坐标 %d/%d", selectedPositionIndex, count)
+end)
+
+bindButton(nextSavedButton, function()
+    local count = #savedPositions
+    if count == 0 then
+        status.Text = "还没有保存坐标"
+        return
+    end
+    selectedPositionIndex = (selectedPositionIndex % count) + 1
+    refreshSavedPositionUI()
+    fillCoordinateBoxes(savedPositions[selectedPositionIndex])
+    status.Text = string.format("已选中坐标 %d/%d", selectedPositionIndex, count)
+end)
+
+bindButton(deleteSavedButton, function()
+    local count = #savedPositions
+    if count == 0 or selectedPositionIndex < 1 then
+        status.Text = "没有可删除的坐标"
+        return
+    end
+    table.remove(savedPositions, selectedPositionIndex)
+    if #savedPositions == 0 then
+        selectedPositionIndex = 0
+    else
+        selectedPositionIndex = math.min(selectedPositionIndex, #savedPositions)
+    end
+    refreshSavedPositionUI()
+    local persisted = persistPositions()
+    status.Text = persisted and "已删除选中坐标并更新文件" or "已删除选中坐标（本次运行有效）"
+end)
+
+bindButton(teleportSavedButton, function()
+    local position = savedPositions[selectedPositionIndex]
+    if not position then
+        status.Text = "还没有保存坐标，请先点击“保存当前位置”"
+        return
+    end
+    local root = getLocalRoot()
+    local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then
+        status.Text = "角色尚未准备好，暂时无法传送"
+        return
+    end
+    root.CFrame = CFrame.new(position)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    if flyVelocity then flyVelocity.Velocity = Vector3.zero end
+    vertical = 0
+    fillCoordinateBoxes(position)
+    status.Text = string.format("已请求传送至坐标 %d/%d：%s", selectedPositionIndex, #savedPositions, formatPosition(position))
+end)
+
+bindButton(teleportButton, function()
+    local x = tonumber(xBox.Text)
+    local y = tonumber(yBox.Text)
+    local z = tonumber(zBox.Text)
+
+    if not (isValidCoordinate(x) and isValidCoordinate(y) and isValidCoordinate(z)) then
+        status.Text = "坐标无效：请分别输入有效的 X、Y、Z 数值"
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then
+        status.Text = "角色尚未准备好，暂时无法传送"
+        return
+    end
+
+    root.CFrame = CFrame.new(x, y, z)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    if flyVelocity then flyVelocity.Velocity = Vector3.zero end
+    vertical = 0
+    status.Text = string.format("已请求传送至 X %.1f / Y %.1f / Z %.1f", x, y, z)
+end)
+
+local function clearESP(player)
+    local objects = espObjects[player]
+    if not objects then return end
+    for _, object in ipairs(objects) do
+        pcall(function() object:Destroy() end)
+    end
+    espObjects[player] = nil
+end
+
+local function applyESP(player)
+    if not espEnabled or player == LocalPlayer then return end
+    local character = player.Character
+    if not character then return end
+    local head = character:FindFirstChild("Head")
+    if not head then return end
+
+    clearESP(player)
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "NinjaPlayerHighlight"
+    highlight.Adornee = character
+    highlight.FillColor = Color3.fromRGB(255, 65, 65)
+    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+    highlight.FillTransparency = 0.55
+    highlight.OutlineTransparency = 0
+    highlight.Parent = character
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "NinjaPlayerName"
+    billboard.Adornee = head
+    billboard.Size = UDim2.fromOffset(170, 30)
+    billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Parent = character
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Text = player.DisplayName
+    label.TextColor3 = Color3.fromRGB(255, 110, 110)
+    label.TextStrokeTransparency = 0.2
+    label.TextScaled = true
+    label.Font = Enum.Font.GothamBold
+    label.Parent = billboard
+    espObjects[player] = {highlight, billboard}
+end
+
+local function clearNPCESP(model)
+    local objects = npcESPObjects[model]
+    if not objects then return end
+    for _, object in ipairs(objects) do
+        pcall(function() object:Destroy() end)
+    end
+    npcESPObjects[model] = nil
+end
+
+local function getNPCPart(model)
+    if not model then return nil end
+    local head = model:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then return head end
+    local root = model:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then return root end
+    local primary = model.PrimaryPart
+    if primary and primary:IsA("BasePart") then return primary end
+    return nil
+end
+
+local function isNPCModel(model)
+    if not model or not model:IsA("Model") then return false end
+    if not model:IsDescendantOf(workspace) then return false end
+    if Players:GetPlayerFromCharacter(model) then return false end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    return humanoid ~= nil and humanoid.Health > 0 and getNPCPart(model) ~= nil
+end
+
+local function applyNPCESP(model)
+    if not npcESPEnabled or not isNPCModel(model) then
+        clearNPCESP(model)
+        return
+    end
+
+    local current = npcESPObjects[model]
+    if current and current[1] and current[1].Parent then return end
+    clearNPCESP(model)
+
+    local targetPart = getNPCPart(model)
+    if not targetPart then return end
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "NinjaNPCSeeingHighlight"
+    highlight.Adornee = model
+    highlight.FillColor = Color3.fromRGB(255, 175, 55)
+    highlight.OutlineColor = Color3.fromRGB(255, 245, 190)
+    highlight.FillTransparency = 0.58
+    highlight.OutlineTransparency = 0
+    highlight.Parent = model
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "NinjaNPCLabel"
+    billboard.Adornee = targetPart
+    billboard.Size = UDim2.fromOffset(150, 26)
+    billboard.StudsOffset = Vector3.new(0, 2.2, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Parent = model
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Text = "NPC · " .. model.Name
+    label.TextColor3 = Color3.fromRGB(255, 195, 95)
+    label.TextStrokeTransparency = 0.2
+    label.TextScaled = true
+    label.Font = Enum.Font.GothamBold
+    label.Parent = billboard
+
+    npcESPObjects[model] = {highlight, billboard}
+end
+
+local function registerNPCFromHumanoid(instance)
+    if not instance or not instance:IsA("Humanoid") then return end
+    local model = instance.Parent
+    if not model or not model:IsA("Model") then return end
+    if Players:GetPlayerFromCharacter(model) then return end
+    npcModels[model] = true
+    if npcESPEnabled then applyNPCESP(model) end
+end
+
+local function scanNPCs()
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if instance:IsA("Humanoid") then
+            registerNPCFromHumanoid(instance)
+        end
+    end
+end
+
+local function refreshNPCESP()
+    if not npcESPEnabled then
+        for model in pairs(npcESPObjects) do clearNPCESP(model) end
+        return
+    end
+    for model in pairs(npcModels) do
+        if isNPCModel(model) then
+            applyNPCESP(model)
+        else
+            clearNPCESP(model)
+            if not model.Parent or not model:IsDescendantOf(workspace) then
+                npcModels[model] = nil
+            end
+        end
+    end
+end
+
+-- Returns true when the camera has an unobstructed ray to the NPC part.
+-- Parts belonging to the local character and camera are excluded from the ray.
+local function hasLineOfSight(targetModel, targetPart, camera)
+    if not targetModel or not targetPart or not camera then return false end
+    local origin = camera.CFrame.Position
+    local direction = targetPart.Position - origin
+    if direction.Magnitude <= 0.001 then return true end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {LocalPlayer.Character, camera}
+    rayParams.IgnoreWater = true
+
+    local result = workspace:Raycast(origin, direction, rayParams)
+    -- No hit means the ray is clear. A hit on the target itself also counts as visible.
+    return result == nil or result.Instance:IsDescendantOf(targetModel)
+end
+
+local function getBestNPCTarget()
+    local camera = workspace.CurrentCamera
+    if not camera then return nil, false end
+    local viewport = camera.ViewportSize
+    local center = Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
+    local bestPart, bestScore = nil, math.huge
+    local bestOccludedScore = math.huge
+
+    for model in pairs(npcModels) do
+        if isNPCModel(model) then
+            local part = getNPCPart(model)
             if part then
-                local dist = (camPos - part.Position).Magnitude
-                if dist <= Config.MaxDistance then
-                    local sp, onScreen = Camera:WorldToViewportPoint(part.Position)
-                    if sp.Z > 0 and onScreen then
-                        local score = (Vector2.new(sp.X, sp.Y) - aimPoint).Magnitude
-                        if score <= Config.FOV and score < bestScore then
-                            if visible(part) then
-                                best, bestPart, bestScore = plr, part, score
-                            end
+                local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
+                if onScreen and screenPoint.Z > 0 then
+                    local delta = Vector2.new(screenPoint.X, screenPoint.Y) - center
+                    local score = delta.Magnitude
+                    if hasLineOfSight(model, part, camera) then
+                        if score < bestScore then
+                            bestScore = score
+                            bestPart = part
                         end
+                    elseif score < bestOccludedScore then
+                        bestOccludedScore = score
                     end
                 end
             end
+        elseif not model.Parent or not model:IsDescendantOf(workspace) then
+            npcModels[model] = nil
+            clearNPCESP(model)
         end
     end
 
-    -- 补充准星: 老式脚本靠 mouse.Hit 取方向的思路，这里轮询读一次，
-    -- 拿落点零件反查是谁的，不用挂全局 __index hook
-    if not best and Config.UseMouseHitAim and mouseHit and mouseHit.Parent then
-        local model = mouseHit:FindFirstAncestorOfClass("Model")
-        if model then
-            local plr = Players:GetPlayerFromCharacter(model)
-            if plr and passesFilter(plr, model) then
-                best, bestPart = plr, mouseHit
-            end
+    -- The second return value distinguishes a blocked on-screen NPC from no target.
+    return bestPart, bestPart == nil and bestOccludedScore < math.huge
+end
+
+local function refreshESP()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if espEnabled then applyESP(player) else clearESP(player) end
         end
     end
-
-    currentTarget, currentPart = best, bestPart
-    return best, bestPart
 end
 
-local function getAimPosition()
-    if not currentPart or not currentPart.Parent then return nil end
-    local pos = currentPart.Position
-    if Config.Prediction > 0 then
-        pos = pos + currentPart.AssemblyLinearVelocity * Config.Prediction
+local function restoreNoclip()
+    noclipEnabled = false
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
     end
-    return pos
+    for part, originalValue in pairs(noclipOriginalCanCollide) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = originalValue
+            end)
+        end
+    end
+    noclipOriginalCanCollide = {}
 end
 
---==============================================================================
--- 5. Silent —— 弹道 hook (窄化版 __namecall)
---==============================================================================
-local HOOK_METHODS = {
-    Raycast = true,
-    RaycastAll = true,
-    FindPartOnRay = true,
-    FindPartOnRayWithIgnoreList = true,
-    FindPartOnRayWithWhitelist = true,
-}
+local function applyNoclipToCharacter()
+    local character = LocalPlayer.Character
+    if not character then return end
+    for _, instance in ipairs(character:GetDescendants()) do
+        if instance:IsA("BasePart") then
+            if noclipOriginalCanCollide[instance] == nil then
+                noclipOriginalCanCollide[instance] = instance.CanCollide
+            end
+            instance.CanCollide = false
+        end
+    end
+end
 
--- 只对弹道方法动手，其余调用一次查表直接透传
-local function buildRay(self, method, ...)
-    if not Config.Enabled then return nil end
-    if Config.Mode ~= "All" and Config.Mode ~= "Silent" then return nil end
+local function refreshButtons()
+    espButton.Text = espEnabled and "透视：开启" or "透视：关闭"
+    flyButton.Text = flying and "飞天：开启" or "飞天：关闭"
+    npcESPButton.Text = npcESPEnabled and "NPC绘制：开启" or "NPC绘制：关闭"
+    npcTrackButton.Text = npcTrackingEnabled and "NPC镜头追踪：开启" or "NPC镜头追踪：关闭"
+    noclipButton.Text = noclipEnabled and "穿墙：开启" or "穿墙：关闭"
+end
 
-    local aimPos = getAimPosition()
-    if not aimPos then return nil end
+local function stopFly()
+    flying = false
+    vertical = 0
+    verticalInput = nil
+    if flyConnection then flyConnection:Disconnect(); flyConnection = nil end
+    if flyVelocity then pcall(function() flyVelocity:Destroy() end); flyVelocity = nil end
+    if flyGyro then pcall(function() flyGyro:Destroy() end); flyGyro = nil end
+end
 
-    local args = { ... }
-
-    if method == "Raycast" or method == "RaycastAll" then
-        local origin, direction = args[1], args[2]
-        if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return nil end
-        if direction.Magnitude < 0.001 then return nil end
-        args[2] = (aimPos - origin).Unit * direction.Magnitude
-        return oldNamecall(self, unpack(args))
+local function startFly()
+    local character = LocalPlayer.Character
+    if not character then status.Text = "角色尚未加载"; return end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then
+        status.Text = "角色尚未准备好"
+        return
     end
 
-    -- 老接口传的是 Ray 对象
-    local ray = args[1]
-    if typeof(ray) ~= "Ray" then return nil end
-    if ray.Direction.Magnitude < 0.001 then return nil end
-    args[1] = Ray.new(ray.Origin, (aimPos - ray.Origin).Unit * ray.Direction.Magnitude)
-    return oldNamecall(self, unpack(args))
+    stopFly()
+    flying = true
+    flyVelocity = Instance.new("BodyVelocity")
+    flyVelocity.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    flyVelocity.P = 1e4
+    flyVelocity.Velocity = Vector3.zero
+    flyVelocity.Parent = root
+
+    flyGyro = Instance.new("BodyGyro")
+    flyGyro.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+    flyGyro.P = 1e5
+    flyGyro.CFrame = root.CFrame
+    flyGyro.Parent = root
+
+    flyConnection = RunService.RenderStepped:Connect(function()
+        if not flying or not root.Parent or humanoid.Health <= 0 then
+            stopFly()
+            refreshButtons()
+            return
+        end
+        -- MoveDirection follows the Roblox mobile thumbstick as well as keyboard input.
+        local move = humanoid.MoveDirection
+        flyVelocity.Velocity = Vector3.new(move.X, 0, move.Z) * flySpeed
+            + Vector3.new(0, vertical * flySpeed, 0)
+        local camera = workspace.CurrentCamera
+        if camera then
+            local look = camera.CFrame.LookVector
+            local flatLook = Vector3.new(look.X, 0, look.Z)
+            if flatLook.Magnitude > 0.001 then
+                flyGyro.CFrame = CFrame.lookAt(root.Position, root.Position + flatLook.Unit)
+            end
+        end
+    end)
+    status.Text = "已开启：摇杆移动，按住升降按钮"
 end
 
-if hookmetamethod and getnamecallmethod and newcclosure then
-    pcall(function()
-        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            if inInternalCall then
-                return oldNamecall(self, ...)
+bindButton(espButton, function()
+    espEnabled = not espEnabled
+    refreshESP()
+    refreshButtons()
+end)
+
+bindButton(flyButton, function()
+    if flying then stopFly() else startFly() end
+    refreshButtons()
+end)
+
+bindButton(npcESPButton, function()
+    npcESPEnabled = not npcESPEnabled
+    if npcESPEnabled then scanNPCs() end
+    refreshNPCESP()
+    status.Text = npcESPEnabled and "NPC绘制已开启（橙色标记）" or "NPC绘制已关闭"
+    refreshButtons()
+end)
+
+bindButton(npcTrackButton, function()
+    npcTrackingEnabled = not npcTrackingEnabled
+    if npcTrackingEnabled then
+        scanNPCs()
+        status.Text = "NPC镜头追踪已开启；实际子弹行为由游戏决定"
+    else
+        status.Text = "NPC镜头追踪已关闭"
+    end
+    refreshButtons()
+end)
+
+bindButton(noclipButton, function()
+    if noclipEnabled then
+        restoreNoclip()
+        status.Text = "穿墙已关闭，已恢复角色部件原碰撞状态"
+    else
+        noclipEnabled = true
+        applyNoclipToCharacter()
+        if noclipConnection then noclipConnection:Disconnect() end
+        -- Reapply every frame so newly added character parts are covered too.
+        noclipConnection = RunService.Stepped:Connect(function()
+            if noclipEnabled and not closed then
+                applyNoclipToCharacter()
             end
+        end)
+        status.Text = "穿墙已开启；效果受游戏服务器校验影响"
+    end
+    refreshButtons()
+end)
 
-            local method = getnamecallmethod()
-            if not HOOK_METHODS[method] then
-                return oldNamecall(self, ...)     -- 全场其它调用: 原样过，不碰
-            end
+npcRegistryConnection = workspace.DescendantAdded:Connect(function(instance)
+    if instance:IsA("Humanoid") then
+        task.defer(registerNPCFromHumanoid, instance)
+    end
+end)
 
-            inInternalCall = true
-            local result = buildRay(self, method, ...)
-            inInternalCall = false
+npcTrackingConnection = RunService.RenderStepped:Connect(function(deltaTime)
+    if not npcTrackingEnabled or closed then return end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
 
-            if result ~= nil then return result end
-            return oldNamecall(self, ...)
-        end))
-        hookedByMeta = true
+    local targetPart, coverBlocked = getBestNPCTarget()
+    if not targetPart or not targetPart.Parent then
+        local message = coverBlocked
+            and "掩体判断：NPC 被墙体/障碍物遮挡，已跳过追踪"
+            or "掩体判断：当前没有视野内的可见 NPC"
+        if status.Text ~= message then status.Text = message end
+        return
+    end
+
+    if status.Text ~= "掩体判断：目标无遮挡，镜头辅助中" then
+        status.Text = "掩体判断：目标无遮挡，镜头辅助中"
+    end
+
+    -- Only adjust the camera when a direct ray to the target is clear.
+    -- This does not change server-side hit detection or projectile behavior.
+    local desired = CFrame.lookAt(camera.CFrame.Position, targetPart.Position)
+    local blend = math.clamp(deltaTime * 7, 0, 0.22)
+    camera.CFrame = camera.CFrame:Lerp(desired, blend)
+end)
+
+local function bindVertical(button, value)
+    button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            vertical = value
+            verticalInput = input
+        end
     end)
 end
-
-if not hookedByMeta then
-    warn("[Zaka] 执行器不支持 hookmetamethod, 走 Velocity 模式")
-    Config.Mode = "Velocity"
-end
-
---==============================================================================
--- 6. Velocity —— 子弹飞行向量追踪
---==============================================================================
-local function isBulletLike(part)
-    local name = part.Name
-    for _, pat in ipairs(Config.BulletNames) do
-        if name == pat or string.find(name, pat, 1, true) then return true end
+bindVertical(upButton, 1)
+bindVertical(downButton, -1)
+UserInputService.InputEnded:Connect(function(input)
+    if input == verticalInput then
+        vertical = 0
+        verticalInput = nil
     end
-    -- 尺寸/速度启发式兜底: 小、细长、速度高、未锚定
-    if not part.Anchored and part:IsA("BasePart") then
-        local v = part.AssemblyLinearVelocity
-        if v.Magnitude > 60 then
-            local s = part.Size
-            if math.max(s.X, s.Y, s.Z) <= 4 and math.min(s.X, s.Y, s.Z) <= 2 then
-                return true
-            end
-        end
+end)
+
+local function bindPlayer(player)
+    if player == LocalPlayer or playerConnections[player] then return end
+    playerConnections[player] = player.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        if espEnabled and not closed then applyESP(player) end
+    end)
+end
+for _, player in ipairs(Players:GetPlayers()) do bindPlayer(player) end
+
+playerAddedConnection = Players.PlayerAdded:Connect(bindPlayer)
+playerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
+    clearESP(player)
+    if playerConnections[player] then
+        playerConnections[player]:Disconnect()
+        playerConnections[player] = nil
     end
-    return false
-end
+end)
 
-local function collectBullets(out, container, depth)
-    if depth > 3 or #out >= Config.MaxBullets then return end
-    local children = container:GetChildren()
-    for i = 1, #children do
-        if #out >= Config.MaxBullets then return end
-        local inst = children[i]
-        if inst:IsA("BasePart") then
-            if isBulletLike(inst) then
-                out[#out + 1] = inst
-            end
-        elseif inst:IsA("Folder") or inst:IsA("Model") then
-            if not inst:FindFirstChildOfClass("Humanoid") then   -- 别往角色里钻
-                collectBullets(out, inst, depth + 1)
-            end
-        end
-    end
-end
-
-local function trackBullets()
-    local aimPos = getAimPosition()
-    if not aimPos then return end
-
-    local list = {}
-    collectBullets(list, Workspace, 0)
-
-    for i = 1, #list do
-        local b = list[i]
-        if b and b.Parent then
-            local vel = b.AssemblyLinearVelocity
-            local spd = vel.Magnitude
-            if spd >= 10 then
-                local dir = aimPos - b.Position
-                if dir.Magnitude > 0.01 then
-                    local newVel = dir.Unit * (spd * Config.SpeedBoost)
-                    local lv = b:FindFirstChildWhichIsA("LinearVelocity")
-                    if lv then
-                        lv.VectorVelocity = newVel            -- 走约束的就改约束
-                    else
-                        b.AssemblyLinearVelocity = newVel     -- 否则直接喂速度
-                    end
-                end
-            end
-        end
-    end
-end
-
-local function untrack()
-    currentTarget, currentPart = nil, nil
-end
-
---==============================================================================
--- 7. 输入 (PC 键位 + 手机触摸)
---==============================================================================
-connections[#connections + 1] = UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if input.KeyCode == Config.ToggleKey then
-        Config.Enabled = not Config.Enabled
-        if not Config.Enabled then untrack() end
-        notify(Config.Enabled and "追踪: 开启" or "追踪: 关闭")
-    elseif input.KeyCode == Config.LockKey then
-        if lockedPlayer then
-            lockedPlayer = nil
-            notify("已解锁目标")
-        else
-            lockedPlayer = currentTarget
-            notify(lockedPlayer and ("已锁定: " .. lockedPlayer.Name) or "没找到可锁目标")
+respawnConnection = LocalPlayer.CharacterAdded:Connect(function()
+    if flying and not closed then
+        task.wait(0.8)
+        if not closed and LocalPlayer.Character then
+            stopFly()
+            startFly()
+            refreshButtons()
         end
     end
 end)
 
--- 手机虚拟按键 (PC 上自动隐藏)
-local function buildHud()
-    local existing = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("ZakaTrackerHUD")
-    if existing then existing:Destroy() end
-
-    hud = Instance.new("ScreenGui")
-    hud.Name = "ZakaTrackerHUD"
-    hud.ResetOnSpawn = false
-    hud.IgnoreGuiInset = true
-    hud.Enabled = IS_MOBILE
-    hud.Parent = (gethui and gethui()) or LP:WaitForChild("PlayerGui")
-
-    local function mkBtn(label, y)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.fromOffset(58, 58)
-        b.Position = UDim2.new(1, -74, 0.5, y)     -- 右侧竖排，挡手就改这个偏移
-        b.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
-        b.BackgroundTransparency = 0.2
-        b.Text = label
-        b.TextSize = 16
-        b.Font = Enum.Font.GothamBold
-        b.TextColor3 = Color3.fromRGB(0, 255, 170)
-        b.BorderSizePixel = 0
-        b.Parent = hud
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, 12)
-        c.Parent = b
-        return b
-    end
-
-    local btnToggle = mkBtn("追踪", -100)
-    local btnLock   = mkBtn("锁定", -34)
-    local btnHold   = mkBtn("按住", 32)
-
-    connections[#connections + 1] = btnToggle.MouseButton1Click:Connect(function()
-        Config.Enabled = not Config.Enabled
-        if not Config.Enabled then untrack() end
-        notify(Config.Enabled and "追踪: 开启" or "追踪: 关闭")
-    end)
-
-    connections[#connections + 1] = btnLock.MouseButton1Click:Connect(function()
-        if lockedPlayer then
-            lockedPlayer = nil
-            notify("已解锁目标")
-        else
-            lockedPlayer = currentTarget
-            notify(lockedPlayer and ("已锁定: " .. lockedPlayer.Name) or "没找到可锁目标")
-        end
-    end)
-
-    connections[#connections + 1] = btnHold.MouseButton1Down:Connect(function() mobileHold = true  end)
-    connections[#connections + 1] = btnHold.MouseButton1Up:Connect(  function() mobileHold = false end)
-    connections[#connections + 1] = btnHold.MouseLeave:Connect(     function() mobileHold = false end)
-
-    -- 手指滑出按钮再松手时上面那俩不一定触发，这里兜底
-    connections[#connections + 1] = UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch then mobileHold = false end
-    end)
-end
-buildHud()
-
---==============================================================================
--- 8. 主循环
---==============================================================================
-local accum = 0
-
-connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
-    -- 轮询 mouse.Hit 代替全局 __index hook (读一次，零副作用)
-    if Config.UseMouseHitAim then
-        pcall(function() mouseHit = mouse.Hit end)
-    end
-
-    accum = accum + dt
-    if accum < Config.UpdateRate then
-        -- 高频段: 子弹修正跟着物理帧走
-        if Config.Enabled and (Config.Mode == "All" or Config.Mode == "Velocity") then
-            trackBullets()
-        end
-        return
-    end
-    accum = 0
-
-    if IS_MOBILE then updateFov() end
-
-    local aimHeld = Config.Enabled
-        and (not Config.HoldToAim or mobileHold or UserInputService:IsKeyDown(Config.HoldKey))
-
-    if not aimHeld then
-        untrack()
-        return
-    end
-
-    findTarget()
-
-    -- Camera 模式: 平滑跟枪(手机禁用，会跟触摸转视角打架)
-    if Config.Mode == "Camera" and not IS_MOBILE and currentPart then
-        local aimPos = getAimPosition()
-        if aimPos then
-            local desired = CFrame.new(Camera.CFrame.Position, aimPos)
-            Camera.CFrame = Camera.CFrame:Lerp(desired, Config.CameraSmooth)
-        end
-    end
+bindButton(closeButton, function()
+    closed = true
+    espEnabled = false
+    npcESPEnabled = false
+    npcTrackingEnabled = false
+    restoreNoclip()
+    stopFly()
+    refreshESP()
+    refreshNPCESP()
+    if npcRegistryConnection then npcRegistryConnection:Disconnect() end
+    if npcTrackingConnection then npcTrackingConnection:Disconnect() end
+    if playerAddedConnection then playerAddedConnection:Disconnect() end
+    if playerRemovingConnection then playerRemovingConnection:Disconnect() end
+    if respawnConnection then respawnConnection:Disconnect() end
+    for _, connection in pairs(playerConnections) do connection:Disconnect() end
+    gui:Destroy()
 end)
 
---==============================================================================
--- 9. 卸载
---==============================================================================
-local function unload()
-    Config.Enabled = false
-    untrack()
-
-    for _, c in ipairs(connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    connections = {}
-
-    -- 还原 hook，否则你永远分不清警告是谁的锅
-    if hookedByMeta and oldNamecall and hookmetamethod then
-        pcall(function() hookmetamethod(game, "__namecall", oldNamecall) end)
-        hookedByMeta = false
-    end
-
-    if hud then pcall(function() hud:Destroy() end) hud = nil end
-
-    notify("已卸载")
-end
-
-local genv = getgenv or function() return _G end
-genv().zakaBulletTracker = { unload = unload, config = Config }
-
-notify("已加载" .. (IS_MOBILE and " [手机模式]" or ""))
-warn("[Zaka] BulletTracker v1.3 loaded | mode=" .. tostring(Config.Mode)
-    .. " | mobile=" .. tostring(IS_MOBILE))
-
---[[
-================================================================================
-  调参速查
---------------------------------------------------------------------------------
-  打不中 / 太飘        → Prediction 0.15~0.20，BulletSpeed 按游戏实际弹速对一下
-  完全不改视角         → Mode = "All" 或 "Silent" (Silent 两个都不动镜头)
-  老执行器没 hook      → 脚本会自己 warn 并切 "Velocity"，靠改子弹向量兜底
-  想看子弹拐弯         → Mode = "Camera" + CameraSmooth 调小 (手机别开)
-  乱锁人(锁到特效/队友)→ TeamCheck = true, IgnoreNames 里加那游戏的零件名
-  手机卡               → Config.UpdateRate 放宽到 0.1，MaxBullets 降到 2~3
-  子弹改不动           → 游戏用的是 LinearVelocity 约束不是直接设速度，
-                          脚本已优先改约束；还没有就说明子弹在服务端模拟
-  卸载                 → getgenv().zakaBulletTracker.unload()
-
-  实话: 命中判定在服务端跑的游戏，客户端只能改自己发出去的射线和飞行向量。
-  游戏要是对上报数据做校验，效果会打折 —— Silent + Velocity 双开已经是
-  客户端能做到的极限。游戏更新后零件命名/结构变了，对一下 BulletNames /
-  IgnoreNames 就行。
-================================================================================
---]]
+loadSavedPositions()
+refreshButtons()
+refreshSpeedLabel()
