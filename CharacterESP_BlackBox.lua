@@ -4,6 +4,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -180,6 +181,277 @@ local function PaintCharacter(model)
 end
 
 -- =========================
+-- Color controls (hex input + mobile-friendly presets)
+-- =========================
+
+local function ColorToHex(color)
+    return string.format("#%02X%02X%02X",
+        math.floor(color.R * 255 + 0.5),
+        math.floor(color.G * 255 + 0.5),
+        math.floor(color.B * 255 + 0.5)
+    )
+end
+
+local function ApplyCurrentColors()
+    for model, record in pairs(Boxes) do
+        if model and model.Parent and IsTarget(model) then
+            PaintCharacter(model)
+        end
+
+        local frame = record and record.Frame
+        local stroke = frame and frame:FindFirstChildOfClass("UIStroke")
+        if stroke then
+            stroke.Color = BOX_COLOR
+        end
+    end
+end
+
+local function CreateColorUI()
+    local function addCorner(object, radius)
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, radius or 7)
+        corner.Parent = object
+        return corner
+    end
+
+    local function makeLabel(parent, text, position, size, textSize)
+        local label = Instance.new("TextLabel")
+        label.BackgroundTransparency = 1
+        label.Position = position
+        label.Size = size
+        label.Font = Enum.Font.GothamSemibold
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(240, 240, 245)
+        label.TextSize = textSize or 14
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = parent
+        return label
+    end
+
+    local function makeButton(parent, text, position, size, background)
+        local button = Instance.new("TextButton")
+        button.Position = position
+        button.Size = size
+        button.BackgroundColor3 = background or Color3.fromRGB(55, 58, 68)
+        button.BorderSizePixel = 0
+        button.Font = Enum.Font.GothamBold
+        button.Text = text
+        button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        button.TextSize = 13
+        button.AutoButtonColor = true
+        button.Parent = parent
+        addCorner(button, 7)
+        return button
+    end
+
+    local toggle = makeButton(
+        GUI,
+        "颜色设置",
+        UDim2.fromOffset(18, 128),
+        UDim2.fromOffset(104, 36),
+        Color3.fromRGB(35, 38, 48)
+    )
+    toggle.Name = "ESP_ColorToggle"
+    toggle.TextSize = 14
+
+    local panel = Instance.new("Frame")
+    panel.Name = "ESP_ColorPanel"
+    panel.Position = UDim2.fromOffset(18, 170)
+    panel.Size = UDim2.fromOffset(300, 282)
+    panel.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
+    panel.BackgroundTransparency = 0.06
+    panel.BorderSizePixel = 0
+    panel.Visible = false
+    panel.Active = true
+    panel.Parent = GUI
+    addCorner(panel, 10)
+
+    local panelStroke = Instance.new("UIStroke")
+    panelStroke.Color = Color3.fromRGB(105, 110, 130)
+    panelStroke.Transparency = 0.25
+    panelStroke.Thickness = 1
+    panelStroke.Parent = panel
+
+    local header = Instance.new("Frame")
+    header.Name = "DragHeader"
+    header.Size = UDim2.new(1, 0, 0, 36)
+    header.BackgroundColor3 = Color3.fromRGB(39, 42, 54)
+    header.BorderSizePixel = 0
+    header.Active = true
+    header.Parent = panel
+    addCorner(header, 10)
+
+    makeLabel(header, "ESP 颜色调节", UDim2.fromOffset(12, 0), UDim2.new(1, -54, 1, 0), 15)
+    local closeButton = makeButton(
+        header, "×", UDim2.new(1, -34, 0, 3), UDim2.fromOffset(29, 29),
+        Color3.fromRGB(75, 48, 53)
+    )
+    closeButton.TextSize = 19
+
+    makeLabel(panel, "人物颜色（支持 HEX，例如 #FF0000）", UDim2.fromOffset(14, 43), UDim2.fromOffset(272, 18), 12)
+    local characterHex = Instance.new("TextBox")
+    characterHex.Name = "CharacterColorHex"
+    characterHex.Position = UDim2.fromOffset(14, 64)
+    characterHex.Size = UDim2.fromOffset(194, 32)
+    characterHex.BackgroundColor3 = Color3.fromRGB(43, 46, 57)
+    characterHex.BorderSizePixel = 0
+    characterHex.ClearTextOnFocus = false
+    characterHex.Font = Enum.Font.GothamBold
+    characterHex.Text = ColorToHex(CHARACTER_COLOR)
+    characterHex.PlaceholderText = "#RRGGBB"
+    characterHex.TextColor3 = Color3.fromRGB(255, 255, 255)
+    characterHex.PlaceholderColor3 = Color3.fromRGB(160, 160, 170)
+    characterHex.TextSize = 14
+    characterHex.Parent = panel
+    addCorner(characterHex, 7)
+
+    local applyCharacter = makeButton(panel, "应用", UDim2.fromOffset(216, 64), UDim2.fromOffset(70, 32), Color3.fromRGB(57, 105, 82))
+
+    makeLabel(panel, "方框颜色", UDim2.fromOffset(14, 145), UDim2.fromOffset(272, 18), 12)
+    local boxHex = Instance.new("TextBox")
+    boxHex.Name = "BoxColorHex"
+    boxHex.Position = UDim2.fromOffset(14, 166)
+    boxHex.Size = UDim2.fromOffset(194, 32)
+    boxHex.BackgroundColor3 = Color3.fromRGB(43, 46, 57)
+    boxHex.BorderSizePixel = 0
+    boxHex.ClearTextOnFocus = false
+    boxHex.Font = Enum.Font.GothamBold
+    boxHex.Text = ColorToHex(BOX_COLOR)
+    boxHex.PlaceholderText = "#RRGGBB"
+    boxHex.TextColor3 = Color3.fromRGB(255, 255, 255)
+    boxHex.PlaceholderColor3 = Color3.fromRGB(160, 160, 170)
+    boxHex.TextSize = 14
+    boxHex.Parent = panel
+    addCorner(boxHex, 7)
+
+    local applyBox = makeButton(panel, "应用", UDim2.fromOffset(216, 166), UDim2.fromOffset(70, 32), Color3.fromRGB(57, 105, 82))
+
+    local status = makeLabel(panel, "可输入 HEX，也可点击下方色块", UDim2.fromOffset(14, 247), UDim2.fromOffset(272, 20), 11)
+    status.TextColor3 = Color3.fromRGB(175, 180, 195)
+
+    local function setColor(which, color)
+        if which == "character" then
+            CHARACTER_COLOR = color
+            characterHex.Text = ColorToHex(color)
+            status.Text = "人物颜色已更新"
+        else
+            BOX_COLOR = color
+            boxHex.Text = ColorToHex(color)
+            status.Text = "方框颜色已更新"
+        end
+        ApplyCurrentColors()
+    end
+
+    local function applyHex(which, textBox)
+        local hex = (textBox.Text or ""):gsub("%s", ""):gsub("^#", "")
+        if #hex ~= 6 or not hex:match("^%x%x%x%x%x%x$") then
+            status.Text = "格式错误，请输入 6 位 HEX，例如 #00FF00"
+            status.TextColor3 = Color3.fromRGB(255, 145, 125)
+            return
+        end
+
+        local r = tonumber(hex:sub(1, 2), 16)
+        local g = tonumber(hex:sub(3, 4), 16)
+        local b = tonumber(hex:sub(5, 6), 16)
+        status.TextColor3 = Color3.fromRGB(175, 180, 195)
+        setColor(which, Color3.fromRGB(r, g, b))
+    end
+
+    applyCharacter.Activated:Connect(function()
+        applyHex("character", characterHex)
+    end)
+    applyBox.Activated:Connect(function()
+        applyHex("box", boxHex)
+    end)
+
+    local characterPresets = {
+        Color3.fromRGB(255, 0, 0),
+        Color3.fromRGB(0, 220, 80),
+        Color3.fromRGB(0, 140, 255),
+        Color3.fromRGB(255, 220, 0),
+        Color3.fromRGB(190, 70, 255),
+        Color3.fromRGB(255, 255, 255),
+    }
+    local boxPresets = {
+        Color3.fromRGB(0, 0, 0),
+        Color3.fromRGB(255, 255, 255),
+        Color3.fromRGB(255, 0, 0),
+        Color3.fromRGB(0, 220, 80),
+        Color3.fromRGB(0, 200, 255),
+        Color3.fromRGB(255, 220, 0),
+    }
+
+    local function makeSwatches(which, colors, y)
+        for index, color in ipairs(colors) do
+            local swatch = Instance.new("TextButton")
+            swatch.Name = which .. "ColorPreset" .. index
+            swatch.Position = UDim2.fromOffset(14 + (index - 1) * 45, y)
+            swatch.Size = UDim2.fromOffset(38, 34)
+            swatch.BackgroundColor3 = color
+            swatch.BorderSizePixel = 0
+            swatch.Text = ""
+            swatch.AutoButtonColor = true
+            swatch.Parent = panel
+            addCorner(swatch, 7)
+
+            local outline = Instance.new("UIStroke")
+            outline.Color = Color3.fromRGB(230, 230, 235)
+            outline.Transparency = 0.45
+            outline.Thickness = 1
+            outline.Parent = swatch
+
+            local selectedColor = color
+            swatch.Activated:Connect(function()
+                setColor(which, selectedColor)
+            end)
+        end
+    end
+
+    makeSwatches("character", characterPresets, 104)
+    makeSwatches("box", boxPresets, 206)
+
+    toggle.Activated:Connect(function()
+        panel.Visible = not panel.Visible
+    end)
+    closeButton.Activated:Connect(function()
+        panel.Visible = false
+    end)
+
+    -- 可拖动标题栏，方便手机端避开游戏按钮。
+    local dragging = false
+    local dragStart
+    local startPosition
+
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPosition = panel.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- =========================
 -- Create black 2D box
 -- =========================
 
@@ -201,6 +473,26 @@ local function CreateBox(model)
     stroke.Transparency = 0
     stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
     stroke.Parent = frame
+
+    -- 方框下方的距离标签；只显示数字，不显示 studs 单位。
+    local boxDistanceLabel = Instance.new("TextLabel")
+    boxDistanceLabel.Name = "ESP_BoxDistance"
+    boxDistanceLabel.AnchorPoint = Vector2.new(0.5, 0)
+    boxDistanceLabel.Size = UDim2.fromOffset(84, 20)
+    boxDistanceLabel.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    boxDistanceLabel.BackgroundTransparency = 0.2
+    boxDistanceLabel.BorderSizePixel = 0
+    boxDistanceLabel.Font = Enum.Font.GothamBold
+    boxDistanceLabel.Text = ""
+    boxDistanceLabel.TextSize = 13
+    boxDistanceLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    boxDistanceLabel.TextStrokeTransparency = 0.5
+    boxDistanceLabel.Visible = false
+    boxDistanceLabel.Parent = GUI
+
+    local boxDistanceCorner = Instance.new("UICorner")
+    boxDistanceCorner.CornerRadius = UDim.new(0, 5)
+    boxDistanceCorner.Parent = boxDistanceLabel
 
     -- 屏幕外方向箭头：固定分布在屏幕中心周围，并显示目标距离。
     local warningHolder = Instance.new("Frame")
@@ -244,6 +536,7 @@ local function CreateBox(model)
 
     Boxes[model] = {
         Frame = frame,
+        BoxDistance = boxDistanceLabel,
         Parts = GetBodyParts(model),
         Warning = warningHolder,
         Arrow = arrow,
@@ -327,7 +620,7 @@ local function UpdateOffscreenWarning(model, record)
     arrow.Rotation = math.deg(math.atan2(dy, dx))
 
     local distance = (root.Position - Camera.CFrame.Position).Magnitude
-    distanceLabel.Text = string.format("%.0f studs", distance)
+    distanceLabel.Text = string.format("%.0f", distance)
     holder.Visible = true
 end
 
@@ -337,12 +630,18 @@ end
 
 local function UpdateBox(model, record)
     local frame = record and record.Frame
-    if not frame then
+    local distanceLabel = record and record.BoxDistance
+    if not frame or not distanceLabel then
         return
     end
 
-    if not IsTarget(model) then
+    local function HideBox()
         frame.Visible = false
+        distanceLabel.Visible = false
+    end
+
+    if not IsTarget(model) then
+        HideBox()
         if record.Warning then
             record.Warning.Visible = false
         end
@@ -351,20 +650,20 @@ local function UpdateBox(model, record)
 
     Camera = Workspace.CurrentCamera
     if not Camera then
-        frame.Visible = false
+        HideBox()
         return
     end
 
     local root = model:FindFirstChild("HumanoidRootPart")
     if not root or not root:IsA("BasePart") then
-        frame.Visible = false
+        HideBox()
         return
     end
 
-    -- 根部件在摄像机后方时，不绘制漂浮方框。
+    -- 根部件在摄像机后方时，不绘制方框；屏幕外箭头由独立逻辑处理。
     local rootScreen, rootOnScreen = Camera:WorldToViewportPoint(root.Position)
     if rootScreen.Z <= 0 then
-        frame.Visible = false
+        HideBox()
         return
     end
 
@@ -405,7 +704,7 @@ local function UpdateBox(model, record)
     end
 
     if validParts < 4 or projectedCount < 4 then
-        frame.Visible = false
+        HideBox()
         return
     end
 
@@ -416,7 +715,7 @@ local function UpdateBox(model, record)
     maxY = math.clamp(maxY, 0, viewport.Y)
 
     if maxX - minX < 2 or maxY - minY < 2 then
-        frame.Visible = false
+        HideBox()
         return
     end
 
@@ -430,7 +729,16 @@ local function UpdateBox(model, record)
         stroke.Transparency = 0
     end
 
+    -- 距离标签始终锚定在方框正下方；贴近屏幕边缘时自动限制在可视区域内。
+    local distance = (root.Position - Camera.CFrame.Position).Magnitude
+    distanceLabel.Text = string.format("%.0f", distance)
+    local labelHalfWidth = distanceLabel.Size.X.Offset / 2
+    local labelX = math.clamp((minX + maxX) / 2, labelHalfWidth, math.max(labelHalfWidth, viewport.X - labelHalfWidth))
+    local labelY = math.clamp(maxY + 4, 0, math.max(0, viewport.Y - distanceLabel.Size.Y.Offset))
+    distanceLabel.Position = UDim2.fromOffset(labelX, labelY)
+
     frame.Visible = true
+    distanceLabel.Visible = true
 end
 
 -- =========================
@@ -451,6 +759,8 @@ local function ScanAll()
         end
     end
 end
+
+CreateColorUI()
 
 ScanAll()
 
@@ -476,9 +786,12 @@ RunService.RenderStepped:Connect(function()
             if record and record.Warning then
                 record.Warning:Destroy()
             end
+            if record and record.BoxDistance then
+                record.BoxDistance:Destroy()
+            end
             Boxes[model] = nil
         end
     end
 end)
 
-print("[CharacterESP] Character filtering, black boxes, and off-screen direction warnings enabled.")
+print("[CharacterESP] Character coloring, adjustable character/box colors, boxes, and off-screen warnings enabled.")
