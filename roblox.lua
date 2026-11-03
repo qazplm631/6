@@ -50,4 +50,4 @@ end
 
 -- 弹窗流程
 showFullscreenPopup("你已成功加载紧急情况", 5)
-showFullscreenPopup("已开启透视罪犯和自动手铐和微加速", 5)
+showFullscreenPopup("已开启透视罪犯和自动手铐和微加速+汽车加速", 5)
