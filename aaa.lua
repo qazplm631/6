@@ -12,12 +12,12 @@ local LP = Players.LocalPlayer
 
 local CFG = {
     MODE         = "config",     -- config / hold / toggle
-    RPS          = 12,
+    RPS          = 10,
     RPS_MAX      = 30,
 
     APPLY_CONFIG = true,
-    COOLDOWN_MUL = 0.2,
-    FIRERATE_MUL = 4,
+    COOLDOWN_MUL = 0.7,
+    FIRERATE_MUL = 2,
     CONFIG_MAX   = 1200,
 
     -- 只认这些（必须带开火语义）
