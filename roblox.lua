@@ -3,6 +3,10 @@ local scripts = {
     "https://raw.githubusercontent.com/qazplm631/6/main/f.lua",
     "https://raw.githubusercontent.com/qazplm631/6/main/ffffff.lua",
     "https://raw.githubusercontent.com/qazplm631/6/main/787878.lua"
+
+"https://raw.githubusercontent.com/qazplm631/6/main/ssss.lua"
+
+"https://raw.githubusercontent.com/qazplm631/6/main/aaa.lua"
 }
 
 for _, url in ipairs(scripts) do
