@@ -5,10 +5,11 @@ local scripts = {
     "https://raw.githubusercontent.com/qazplm631/6/main/787878.lua",
     "https://raw.githubusercontent.com/qazplm631/6/main/ssss.lua",
     "https://raw.githubusercontent.com/qazplm631/6/main/aaa.lua",
-    "https://raw.githubusercontent.com/qazplm631/6/main/%E6%97%A0%E5%90%8E%E5%BA%A7.lua"
+    "https://raw.githubusercontent.com/qazplm631/6/main/%E6%97%A0%E5%90%8E%E5%BA%A7.lua",
+    "https://raw.githubusercontent.com/qazplm631/6/main/%E4%BC%A0%E9%80%81.lua"
 }
 
--- 按顺序加载
+-- 按顺序执行
 for _, url in ipairs(scripts) do
     local success, err = pcall(function()
         local source = game:HttpGet(url)
@@ -36,7 +37,6 @@ local playerGui = player:WaitForChild("PlayerGui")
 
 -- 全屏弹窗动画
 local function showFullscreenPopup(message)
-
     local screenGui = Instance.new("ScreenGui")
     screenGui.Name = "EmergencyNotification"
     screenGui.IgnoreGuiInset = true
@@ -79,7 +79,7 @@ local function showFullscreenPopup(message)
     enterTween:Play()
     enterTween.Completed:Wait()
 
-    -- 停留3秒
+    -- 中央停留3秒
     task.wait(3)
 
     -- 淡出动画
@@ -103,7 +103,6 @@ local function showFullscreenPopup(message)
     fadeText:Play()
 
     fadeBackground.Completed:Wait()
-
     screenGui:Destroy()
 end
 
@@ -111,4 +110,4 @@ end
 showFullscreenPopup("你已成功加载紧急情况")
 
 -- 第二个弹窗
-showFullscreenPopup("nbnbnb")
+showFullscreenPopup("676767")
