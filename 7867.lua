@@ -110,4 +110,4 @@ end
 showFullscreenPopup("你已成功加载紧急情况")
 
 -- 第二个弹窗
-showFullscreenPopup("676767")
+showFullscreenPopup("稳是无后座，速是汽车加速，弹是无限子弹，自是自动手铐，射是射速，地是传送。")
