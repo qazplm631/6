@@ -80,7 +80,7 @@ local function showFullscreenPopup(message)
     enterTween.Completed:Wait()
 
     -- 中央停留3秒
-    task.wait(3)
+    task.wait(6)
 
     -- 淡出动画
     local fadeBackground = TweenService:Create(
