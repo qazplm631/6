@@ -3,10 +3,9 @@ local scripts = {
     "https://raw.githubusercontent.com/qazplm631/6/main/f.lua",
     "https://raw.githubusercontent.com/qazplm631/6/main/ffffff.lua",
     "https://raw.githubusercontent.com/qazplm631/6/main/787878.lua",
-    "https://raw.githubusercontent.com/qazplm631/6/main/ssss.lua",
-    "https://raw.githubusercontent.com/qazplm631/6/main/aaa.lua",
     "https://raw.githubusercontent.com/qazplm631/6/main/%E6%97%A0%E5%90%8E%E5%BA%A7.lua",
-    "https://raw.githubusercontent.com/qazplm631/6/main/%E4%BC%A0%E9%80%81.lua"
+    "https://raw.githubusercontent.com/qazplm631/6/main/%E4%BC%A0%E9%80%81.lua",
+    "https://raw.githubusercontent.com/qazplm631/6/main/%E7%8E%A9%E5%AE%B6%E4%BC%A0%E9%80%81V2.lua"
 }
 
 -- 按顺序执行
